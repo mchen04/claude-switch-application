@@ -15,7 +15,7 @@ pub fn run(_paths: &Paths, _global: &GlobalOpts, args: &SetupArgs) -> Result<()>
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(Error::io_at(&rc, e)),
     };
-    let updated = shell::upsert_block(&existing, shell.snippet());
+    let updated = shell::upsert_block(&existing, shell.snippet())?;
 
     if existing == updated {
         eprintln!(

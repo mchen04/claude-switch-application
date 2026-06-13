@@ -18,6 +18,7 @@ pub fn run(
     target_name: &str,
     passthrough: &[String],
 ) -> Result<()> {
+    crate::paths::validate_profile_name(target_name)?;
     let _lock = CsLock::acquire(paths)?;
     paths.ensure_cs_home()?;
     run_locked(paths, kc, global, target_name)?;
@@ -42,14 +43,29 @@ pub(crate) fn run_locked(
     global: &GlobalOpts,
     target_name: &str,
 ) -> Result<()> {
-    let claude_target = read_target_claude(kc, target_name)?;
-
     let canonical = keychain::canonical_account();
     let prev_canonical_blob = kc.read(&canonical).ok();
-    let prev_settings = fs::read(paths.claude_settings()).ok();
     let state_path = paths.state_file();
     let mut state = State::load(&state_path).unwrap_or_default();
     let prior_active = state.active.clone();
+
+    // Preserve the outgoing account's *live* credentials before we overwrite the
+    // canonical entry. Claude Code rotates the OAuth access+refresh token in the
+    // canonical entry as it runs, and a rotated refresh token invalidates its
+    // predecessor server-side. The profile snapshot saved by `cs` never sees
+    // those rotations, so without this flush, switching away and later back
+    // installs a long-dead refresh token and Claude Code logs the user out. Copy
+    // the freshest canonical blob into the outgoing profile entry first. This
+    // runs before we read the target, so re-selecting the active profile reads
+    // back the just-synced creds instead of downgrading canonical to a snapshot.
+    if let (Some(prev_name), Some(prev_blob)) =
+        (prior_active.as_deref(), prev_canonical_blob.as_deref())
+    {
+        sync_canonical_to_profile(kc, prev_name, prev_blob);
+    }
+
+    let claude_target = read_target_claude(kc, target_name)?;
+    let prev_settings = fs::read(paths.claude_settings()).ok();
 
     let target_creds = OauthCreds::parse(&claude_target)?;
     if target_creds.is_expired(std::time::Duration::from_secs(60)) {
@@ -133,6 +149,55 @@ fn rollback_claude(kc: &dyn Keychain, canonical: &str, prev: Option<&[u8]>) {
             eprintln!("error: keychain rollback failed for {canonical}: {e}");
             tracing::error!(account = %canonical, error = %e, "keychain rollback failed");
         }
+    }
+}
+
+/// Copy the canonical (live) credential blob back into the outgoing profile's
+/// Keychain entry so its snapshot keeps pace with Claude Code's background token
+/// rotation. Best-effort and identity-guarded: only writes when `blob` is valid
+/// OAuth creds for the *same account* the profile already holds (matched by
+/// email), so a canonical that belongs to a different account the user logged
+/// into directly never overwrites the wrong snapshot. Skips when the profile
+/// entry is absent (we never resurrect a removed profile) and never deletes the
+/// existing snapshot on failure — at worst the snapshot stays as stale as it was
+/// before, which is the pre-fix behaviour, so this can only help.
+fn sync_canonical_to_profile(kc: &dyn Keychain, profile_name: &str, blob: &[u8]) {
+    let account = keychain::profile_account(profile_name);
+    let Ok(existing_blob) = kc.read(&account) else {
+        return; // no snapshot for the outgoing profile — nothing to keep in sync
+    };
+    if existing_blob == blob {
+        return; // already current
+    }
+    // Only refuse the sync when we can prove the canonical blob is a *different* account
+    // (e.g. the user ran `claude /login` as someone else without `cs save`). An
+    // unparseable blob on either side is treated as "can't prove same account" and also
+    // skipped. Crucially, two email-less blobs are NOT a mismatch — see is_cross_account.
+    let cross_account = match (OauthCreds::parse(blob), OauthCreds::parse(&existing_blob)) {
+        (Ok(incoming), Ok(existing)) => {
+            crate::profile::is_cross_account(incoming.email(), existing.email())
+        }
+        _ => true,
+    };
+    if cross_account {
+        tracing::warn!(
+            profile = %profile_name,
+            "canonical credential is a different account than the saved profile; not syncing"
+        );
+        return;
+    }
+    if let Err(e) = kc.write(&account, blob) {
+        tracing::warn!(profile = %profile_name, error = %e, "failed to sync rotated token into profile");
+        return;
+    }
+    match kc.read(&account) {
+        Ok(b) if b == blob => {
+            tracing::info!(profile = %profile_name, "synced rotated canonical token into outgoing profile");
+        }
+        _ => tracing::warn!(
+            profile = %profile_name,
+            "sync read-back mismatch; profile snapshot may still be stale"
+        ),
     }
 }
 

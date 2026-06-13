@@ -55,45 +55,53 @@ impl Shell {
 }
 
 /// Replace any existing `begin ... end` block with `body`, or append it if absent.
-/// Returns the new file contents.
-pub fn upsert_block(existing: &str, body: &str) -> String {
+/// Errors if the rc file contains a malformed (half-present or out-of-order) marker pair.
+pub fn upsert_block(existing: &str, body: &str) -> Result<String> {
     upsert_block_named(existing, BEGIN_MARKER, END_MARKER, body)
 }
 
-/// Replace any existing `begin ... end` block with `body`, or append it if absent.
-/// Returns the new file contents.
-pub fn upsert_block_named(existing: &str, begin: &str, end: &str, body: &str) -> String {
-    if let (Some(start), Some(stop)) = (existing.find(begin), existing.find(end)) {
-        if start < stop {
+/// Replace a well-formed `begin ... end` block with `body`; append a fresh block when
+/// neither marker is present. If exactly one marker is present, or they appear out of
+/// order, the existing block is malformed: refuse rather than append a second `begin`,
+/// which a later run would treat as the block start and use to clobber user content
+/// sitting between the orphaned markers.
+pub fn upsert_block_named(existing: &str, begin: &str, end: &str, body: &str) -> Result<String> {
+    match (existing.find(begin), existing.find(end)) {
+        (Some(start), Some(stop)) if start < stop => {
             let end_line = existing[stop..]
                 .find('\n')
                 .map(|n| stop + n + 1)
                 .unwrap_or(existing.len());
             let mut out = String::with_capacity(existing.len());
             out.push_str(&existing[..start]);
-            out.push_str(begin);
-            out.push('\n');
-            out.push_str(body.trim_end_matches('\n'));
-            out.push('\n');
-            out.push_str(end);
-            out.push('\n');
+            push_block(&mut out, begin, end, body);
             out.push_str(&existing[end_line..]);
-            return out;
+            Ok(out)
         }
+        (None, None) => {
+            let mut out = String::with_capacity(existing.len() + body.len() + 64);
+            out.push_str(existing);
+            if !existing.is_empty() && !existing.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
+            push_block(&mut out, begin, end, body);
+            Ok(out)
+        }
+        _ => Err(Error::Config(format!(
+            "the cs wrapper markers in the rc file are malformed (one marker missing or out \
+             of order); fix or remove the `{begin}` / `{end}` block manually, then re-run"
+        ))),
     }
-    let mut out = String::with_capacity(existing.len() + body.len() + 64);
-    out.push_str(existing);
-    if !existing.is_empty() && !existing.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push('\n');
+}
+
+fn push_block(out: &mut String, begin: &str, end: &str, body: &str) {
     out.push_str(begin);
     out.push('\n');
     out.push_str(body.trim_end_matches('\n'));
     out.push('\n');
     out.push_str(end);
     out.push('\n');
-    out
 }
 
 /// Remove the `# >>> cs ... # <<< cs` block if present. Returns the new file contents.
@@ -125,7 +133,7 @@ mod tests {
 
     #[test]
     fn upsert_appends_when_missing() {
-        let s = upsert_block("export FOO=1\n", "alias x=y");
+        let s = upsert_block("export FOO=1\n", "alias x=y").unwrap();
         assert!(s.contains(BEGIN_MARKER));
         assert!(s.contains("alias x=y"));
         assert!(s.contains(END_MARKER));
@@ -133,16 +141,24 @@ mod tests {
 
     #[test]
     fn upsert_replaces_existing() {
-        let initial = upsert_block("export A=1\n", "alias x=y");
-        let updated = upsert_block(&initial, "alias x=z");
+        let initial = upsert_block("export A=1\n", "alias x=y").unwrap();
+        let updated = upsert_block(&initial, "alias x=z").unwrap();
         assert!(updated.contains("alias x=z"));
         assert!(!updated.contains("alias x=y"));
         assert_eq!(updated.matches(BEGIN_MARKER).count(), 1);
     }
 
     #[test]
+    fn upsert_refuses_malformed_half_present_block() {
+        // BEGIN marker present but END truncated away: refuse rather than append a second
+        // block (which a later run would treat as the start and clobber user content).
+        let corrupted = format!("user line\n{BEGIN_MARKER}\nclaude() {{ :; }}\n");
+        assert!(upsert_block(&corrupted, "alias x=y").is_err());
+    }
+
+    #[test]
     fn remove_drops_block_idempotent() {
-        let with = upsert_block("export A=1\n", "alias x=y");
+        let with = upsert_block("export A=1\n", "alias x=y").unwrap();
         let without = remove_block(&with);
         assert!(!without.contains(BEGIN_MARKER));
         assert_eq!(remove_block(&without), without);

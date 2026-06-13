@@ -48,7 +48,22 @@ main.rs → cli::Cli → commands/<cmd>.rs → keychain / paths / state / master
   `Claude Code-credentials-<name>` for saved profiles, account `$USER` for
   the canonical entry. Same naming as the legacy `claude-switch` bash tool.
 - **Verified writes** — every Keychain write is read back and byte-compared;
-  on mismatch we roll back to the previous credential.
+  on mismatch we roll back to the previous credential. `write_verified` deletes
+  the entry on mismatch, so it is only ever applied to **profile** accounts;
+  canonical (`$USER`) writes use an inline write+read-back+rollback that never
+  deletes, so the live entry can't be left empty.
+- **No-logout token preservation** — Claude Code rotates the OAuth
+  access+refresh token in the canonical (`$USER`) entry as it runs, and a
+  rotated refresh token invalidates its predecessor server-side. Profile
+  entries are snapshots that don't see those rotations, so `switch` flushes the
+  live canonical blob into the *outgoing* profile (`sync_canonical_to_profile`,
+  identity-guarded by `profile::is_cross_account`) **before** overwriting
+  canonical, and `refresh` refreshes the active profile in place (no
+  stage/rollback) while only staging non-active profiles. `is_cross_account`
+  blocks a sync only when both blobs carry an email and they differ — two
+  email-less blobs are the same account and must still sync, or the switch-back
+  logout returns. **Never** add a path that overwrites canonical without first
+  preserving the outgoing account's rotated credential.
 - **Atomic file writes** — all JSON mutations go through
   `jsonio::atomic_write_bytes` (tempfile + `rename(2)`).
 - **Locking** — `CsLock` (advisory `flock` on `~/.claude-cs/.lock`) is
@@ -64,7 +79,10 @@ main.rs → cli::Cli → commands/<cmd>.rs → keychain / paths / state / master
 
 - Use `Error::io_at(path, source)` whenever an io error carries a path.
 - Prefer `jsonio::load_or_default` for JSON config files (treats missing as default).
-- Emit JSON via `output::emit_json`; emit text via `output::emit_text`.
+- Emit JSON via `output::emit_json`; emit text via `output::emit_text`. For a
+  report type that impls both `Serialize` + `Display`, prefer
+  `output::emit(OutputOpts { json }, &report)`, which dispatches on the flag
+  (see `doctor`/`status`) instead of branching at the call site.
 
 ## Scope
 

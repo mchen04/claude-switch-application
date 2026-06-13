@@ -52,6 +52,14 @@ pub fn run(paths: &Paths, kc: &dyn Keychain) -> Result<()> {
             return Ok(());
         }
     };
+    // When the live fetch hit 429, fetch_for serves arbitrarily-old past-TTL cache and flags
+    // it stale. The endpoint can stay 429-locked for 30+ minutes, so acting on that data could
+    // swap credentials based on utilizations that are tens of minutes out of date. Skip this
+    // tick rather than switch on data the endpoint refused to refresh.
+    if active_outcome.stale {
+        tracing::info!(profile = %active_name, "active usage is stale (rate-limited cache); skipping auto-switch this tick");
+        return Ok(());
+    }
     let active_limits = active_outcome.limits;
 
     if active_limits.five_hour.utilization < 100.0
@@ -110,6 +118,11 @@ fn enumerate_others(
         let Ok(blob) = kc.read(&acct) else { continue };
         let Ok(creds) = OauthCreds::parse(&blob) else { continue };
         match limits::fetch_for(&name, &creds, paths, CACHE_MAX_AGE) {
+            // Same reasoning as the active-profile stale gate: a 429-served past-TTL cache can
+            // be tens of minutes old, so a stale candidate must not be trusted as switch target.
+            Ok(o) if o.stale => {
+                tracing::info!(profile = %name, "skip stale (rate-limited cache) candidate in auto-switch tick");
+            }
             Ok(o) => out.push((name, o.limits)),
             Err(e) => tracing::info!(profile = %name, error = %e, "skip profile in auto-switch tick"),
         }

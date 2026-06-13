@@ -30,6 +30,9 @@ fn run_status(paths: &Paths, global: &GlobalOpts) -> Result<()> {
 }
 
 fn run_set(paths: &Paths, global: &GlobalOpts, name: &str) -> Result<()> {
+    // `name` becomes `profile_dir(name)`, the move/symlink target for shared config; an
+    // unvalidated `..` would retarget those operations against the wrong directory.
+    crate::paths::validate_profile_name(name)?;
     let _lock = CsLock::acquire(paths)?;
     let state_path = paths.state_file();
     let mut state = State::load(&state_path).unwrap_or_default();

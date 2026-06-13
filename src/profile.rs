@@ -57,6 +57,19 @@ impl OauthCreds {
     }
 }
 
+/// Positive evidence that two credential blobs belong to *different* accounts: both carry
+/// an email and the emails differ. Absent emails are deliberately NOT a mismatch.
+///
+/// `email` is optional in the OAuth blob, and `cs` treats email-less blobs as first-class.
+/// For the rotated-token sync on switch/refresh, the only credential we may safely refuse
+/// to copy is one we can prove is a *different* account — otherwise we skip preserving the
+/// outgoing account's freshly rotated refresh token and log the user out on switch-back.
+/// So we block only the (Some, Some)-and-differ case; (None, None), (Some, None), and
+/// (None, Some) all fall through as "not provably different" and are allowed to sync.
+pub fn is_cross_account(a: Option<&str>, b: Option<&str>) -> bool {
+    matches!((a, b), (Some(x), Some(y)) if x != y)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProfileSummary {
     pub name: String,

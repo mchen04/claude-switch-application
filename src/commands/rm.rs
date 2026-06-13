@@ -6,6 +6,9 @@ use crate::paths::Paths;
 use crate::state::State;
 
 pub fn run(paths: &Paths, kc: &dyn Keychain, _global: &GlobalOpts, args: &NameArg) -> Result<()> {
+    // Guard before touching the filesystem: an unvalidated name like `../../x` would make
+    // `profile_dir` resolve outside the profiles tree and `remove_dir_all` an arbitrary dir.
+    crate::paths::validate_profile_name(&args.name)?;
     let _lock = CsLock::acquire(paths)?;
 
     let state_pre = State::load(&paths.state_file()).unwrap_or_default();

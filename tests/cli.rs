@@ -42,6 +42,13 @@ fn fixture_path(dir: &std::path::Path, blobs: &[(&str, &str)]) -> PathBuf {
 }
 
 fn fake_oauth(email: &str, expires_in_secs: i64) -> String {
+    fake_oauth_tagged(email, expires_in_secs, email)
+}
+
+/// Like [`fake_oauth`] but the access/refresh tokens carry `tag` so two blobs for the
+/// *same* account (same email) can be made distinguishable — modelling Claude Code
+/// rotating the canonical token while the saved snapshot lags behind.
+fn fake_oauth_tagged(email: &str, expires_in_secs: i64, tag: &str) -> String {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -49,12 +56,33 @@ fn fake_oauth(email: &str, expires_in_secs: i64) -> String {
     let exp = now_ms + expires_in_secs * 1000;
     serde_json::json!({
         "claudeAiOauth": {
-            "accessToken": format!("tok-{email}"),
-            "refreshToken": format!("ref-{email}"),
+            "accessToken": format!("tok-{tag}"),
+            "refreshToken": format!("ref-{tag}"),
             "expiresAt": exp,
             "scopes": ["user:profile"],
             "subscriptionType": "max",
             "email": email
+        }
+    })
+    .to_string()
+}
+
+/// An OAuth blob with NO `email` field — Claude Code's schema makes email optional, and cs
+/// must still preserve the rotated token for these (the identity guard must not treat two
+/// email-less blobs as different accounts).
+fn fake_oauth_no_email(expires_in_secs: i64, tag: &str) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let exp = now_ms + expires_in_secs * 1000;
+    serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": format!("tok-{tag}"),
+            "refreshToken": format!("ref-{tag}"),
+            "expiresAt": exp,
+            "scopes": ["user:profile"],
+            "subscriptionType": "max"
         }
     })
     .to_string()
@@ -292,6 +320,318 @@ fn switch_previous_toggles() {
         serde_json::from_slice(&std::fs::read(cs_home.join("state.json")).unwrap()).unwrap();
     assert_eq!(state["active"], "personal");
     assert_eq!(state["previous"], "work");
+}
+
+#[test]
+fn switch_away_preserves_rotated_canonical_token() {
+    // Regression (logout bug): switching away from a profile must flush Claude Code's
+    // freshly rotated canonical credential back into that profile's snapshot. Otherwise
+    // the snapshot keeps a refresh token that rotation has invalidated server-side, and
+    // switching back later reinstalls a dead token — Claude Code then logs the user out.
+    let (dir, claude_home, cs_home) = isolated();
+    let a_v0 = fake_oauth_tagged("a@example.com", 3600, "a-v0");
+    let b_blob = fake_oauth_tagged("b@example.com", 3600, "b-v0");
+    let fixture = fixture_path(
+        dir.path(),
+        &[
+            ("test-user", &a_v0),
+            ("Claude Code-credentials-a", &a_v0),
+            ("Claude Code-credentials-b", &b_blob),
+        ],
+    );
+
+    // Establish `a` as active (prior_active is None, so nothing to flush yet).
+    phase_c_env(&claude_home, &cs_home, &fixture)
+        .args(["a"])
+        .assert()
+        .success();
+
+    // Claude Code rotates the canonical access+refresh token in place while `a` runs.
+    let a_v1 = fake_oauth_tagged("a@example.com", 7200, "a-v1");
+    let fixture = fixture_path(
+        dir.path(),
+        &[
+            ("test-user", &a_v1),
+            ("Claude Code-credentials-a", &a_v0),
+            ("Claude Code-credentials-b", &b_blob),
+        ],
+    );
+
+    // Switch away to `b`: the outgoing `a` snapshot must capture the rotated token.
+    phase_c_env(&claude_home, &cs_home, &fixture)
+        .args(["b"])
+        .assert()
+        .success();
+
+    let kc: serde_json::Value = serde_json::from_slice(&std::fs::read(&fixture).unwrap()).unwrap();
+    assert_eq!(
+        kc["Claude Code-credentials-a"].as_str().unwrap(),
+        a_v1,
+        "switching away should sync the rotated canonical token into profile a"
+    );
+    assert_eq!(kc["test-user"].as_str().unwrap(), b_blob);
+}
+
+#[test]
+fn reselect_active_does_not_downgrade_canonical() {
+    // Re-selecting the already-active profile must not clobber the live (rotated)
+    // canonical token with the older snapshot.
+    let (dir, claude_home, cs_home) = isolated();
+    let v0 = fake_oauth_tagged("a@example.com", 3600, "a-v0");
+    let fixture = fixture_path(
+        dir.path(),
+        &[("test-user", &v0), ("Claude Code-credentials-a", &v0)],
+    );
+    phase_c_env(&claude_home, &cs_home, &fixture)
+        .args(["a"])
+        .assert()
+        .success();
+
+    let v1 = fake_oauth_tagged("a@example.com", 7200, "a-v1");
+    let fixture = fixture_path(
+        dir.path(),
+        &[("test-user", &v1), ("Claude Code-credentials-a", &v0)],
+    );
+
+    phase_c_env(&claude_home, &cs_home, &fixture)
+        .args(["a"])
+        .assert()
+        .success();
+
+    let kc: serde_json::Value = serde_json::from_slice(&std::fs::read(&fixture).unwrap()).unwrap();
+    assert_eq!(
+        kc["test-user"].as_str().unwrap(),
+        v1,
+        "re-selecting active must keep the rotated canonical, not downgrade to the snapshot"
+    );
+    assert_eq!(kc["Claude Code-credentials-a"].as_str().unwrap(), v1);
+}
+
+#[test]
+fn switch_away_skips_sync_when_canonical_is_a_different_account() {
+    // If the user logged into a different account directly (canonical no longer matches
+    // the active profile), switching away must NOT overwrite the outgoing snapshot with
+    // the foreign credentials.
+    let (dir, claude_home, cs_home) = isolated();
+    let a_v0 = fake_oauth_tagged("a@example.com", 3600, "a-v0");
+    let b_blob = fake_oauth_tagged("b@example.com", 3600, "b-v0");
+    let fixture = fixture_path(
+        dir.path(),
+        &[
+            ("test-user", &a_v0),
+            ("Claude Code-credentials-a", &a_v0),
+            ("Claude Code-credentials-b", &b_blob),
+        ],
+    );
+    phase_c_env(&claude_home, &cs_home, &fixture)
+        .args(["a"])
+        .assert()
+        .success();
+
+    // A *different* account is now in canonical (direct `claude /login`, no `cs save`).
+    let foreign = fake_oauth_tagged("zzz@example.com", 3600, "z-v0");
+    let fixture = fixture_path(
+        dir.path(),
+        &[
+            ("test-user", &foreign),
+            ("Claude Code-credentials-a", &a_v0),
+            ("Claude Code-credentials-b", &b_blob),
+        ],
+    );
+    phase_c_env(&claude_home, &cs_home, &fixture)
+        .args(["b"])
+        .assert()
+        .success();
+
+    let kc: serde_json::Value = serde_json::from_slice(&std::fs::read(&fixture).unwrap()).unwrap();
+    assert_eq!(
+        kc["Claude Code-credentials-a"].as_str().unwrap(),
+        a_v0,
+        "snapshot a must be untouched when canonical belongs to another account"
+    );
+}
+
+#[test]
+fn switch_away_preserves_rotated_token_for_emailless_blobs() {
+    // Regression for the identity guard: two email-less blobs are the same account, so the
+    // rotated token must still be synced on switch-away — otherwise email-less logins hit the
+    // original switch-back logout the fix was meant to remove.
+    let (dir, claude_home, cs_home) = isolated();
+    let a_v0 = fake_oauth_no_email(3600, "a-v0");
+    let b_blob = fake_oauth_no_email(3600, "b-v0");
+    let fixture = fixture_path(
+        dir.path(),
+        &[
+            ("test-user", &a_v0),
+            ("Claude Code-credentials-a", &a_v0),
+            ("Claude Code-credentials-b", &b_blob),
+        ],
+    );
+    phase_c_env(&claude_home, &cs_home, &fixture)
+        .args(["a"])
+        .assert()
+        .success();
+
+    let a_v1 = fake_oauth_no_email(7200, "a-v1");
+    let fixture = fixture_path(
+        dir.path(),
+        &[
+            ("test-user", &a_v1),
+            ("Claude Code-credentials-a", &a_v0),
+            ("Claude Code-credentials-b", &b_blob),
+        ],
+    );
+    phase_c_env(&claude_home, &cs_home, &fixture)
+        .args(["b"])
+        .assert()
+        .success();
+
+    let kc: serde_json::Value = serde_json::from_slice(&std::fs::read(&fixture).unwrap()).unwrap();
+    assert_eq!(
+        kc["Claude Code-credentials-a"].as_str().unwrap(),
+        a_v1,
+        "email-less rotated token must still be synced on switch-away"
+    );
+}
+
+#[test]
+fn refresh_active_refreshes_canonical_in_place_and_mirrors_snapshot() {
+    // The active profile is refreshed in place: the live canonical is rotated by Claude
+    // Code and the result is mirrored into the snapshot — never rolled back to stale.
+    let (dir, claude_home, cs_home) = isolated();
+    let canon0 = fake_oauth_tagged("a@example.com", 3600, "canon0");
+    let snap0 = fake_oauth_tagged("a@example.com", 3600, "snap0");
+    let fixture = fixture_path(
+        dir.path(),
+        &[
+            ("test-user", &canon0),
+            ("Claude Code-credentials-a", &snap0),
+        ],
+    );
+    write_active(&cs_home, "a");
+
+    let path = claude_shim_rotating(&dir, "canon0", "canon1");
+
+    phase_c_env(&claude_home, &cs_home, &fixture)
+        .env("PATH", &path)
+        .args(["refresh", "a"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("refreshed `a`"));
+
+    let kc: serde_json::Value = serde_json::from_slice(&std::fs::read(&fixture).unwrap()).unwrap();
+    let canon1 = canon0.replace("canon0", "canon1");
+    // Live session keeps the refreshed token (NOT rolled back to canon0).
+    assert_eq!(kc["test-user"].as_str().unwrap(), canon1);
+    // Snapshot mirrors the refreshed canonical.
+    assert_eq!(kc["Claude Code-credentials-a"].as_str().unwrap(), canon1);
+}
+
+#[test]
+fn refresh_active_unchanged_updates_stale_snapshot_without_login_prompt() {
+    // Active profile whose live canonical is already fresh but whose snapshot lagged behind a
+    // prior background rotation: refresh must NOT error with "run claude /login". It should
+    // refresh the snapshot from the live creds and report the token still valid.
+    let (dir, claude_home, cs_home) = isolated();
+    let canonical_fresh = fake_oauth("a@example.com", 3600);
+    let snap_expired = fake_oauth("a@example.com", -3600);
+    let fixture = fixture_path(
+        dir.path(),
+        &[
+            ("test-user", &canonical_fresh),
+            ("Claude Code-credentials-a", &snap_expired),
+        ],
+    );
+    write_active(&cs_home, "a");
+
+    // Shim `claude` that does nothing: canonical is already current, so no rotation happens.
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let shim = bin_dir.join("claude");
+    std::fs::write(&shim, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&shim, perms).unwrap();
+    }
+    let mut path = bin_dir.into_os_string();
+    path.push(":/usr/bin:/bin");
+
+    phase_c_env(&claude_home, &cs_home, &fixture)
+        .env("PATH", &path)
+        .args(["refresh", "a"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("still valid"))
+        .stderr(predicate::str::contains("claude /login").not());
+
+    let kc: serde_json::Value = serde_json::from_slice(&std::fs::read(&fixture).unwrap()).unwrap();
+    assert_eq!(
+        kc["Claude Code-credentials-a"].as_str().unwrap(),
+        canonical_fresh,
+        "stale snapshot should have been refreshed from the live canonical"
+    );
+}
+
+#[test]
+fn refresh_background_profile_persists_and_restores_canonical() {
+    // A non-active profile is staged into canonical, refreshed, persisted, and then the
+    // live canonical is restored to the active account — so the live session is never
+    // left logged into the wrong (refreshed) account.
+    let (dir, claude_home, cs_home) = isolated();
+    let active_z = fake_oauth_tagged("z@example.com", 3600, "canonZ");
+    let w0 = fake_oauth_tagged("w@example.com", 3600, "snap0");
+    let fixture = fixture_path(
+        dir.path(),
+        &[
+            ("test-user", &active_z),
+            ("Claude Code-credentials-z", &active_z),
+            ("Claude Code-credentials-w", &w0),
+        ],
+    );
+    write_active(&cs_home, "z");
+
+    let path = claude_shim_rotating(&dir, "snap0", "snap1");
+
+    phase_c_env(&claude_home, &cs_home, &fixture)
+        .env("PATH", &path)
+        .args(["refresh", "w"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("refreshed `w`"));
+
+    let kc: serde_json::Value = serde_json::from_slice(&std::fs::read(&fixture).unwrap()).unwrap();
+    let w1 = w0.replace("snap0", "snap1");
+    // Background profile got refreshed...
+    assert_eq!(kc["Claude Code-credentials-w"].as_str().unwrap(), w1);
+    // ...and the live canonical was restored to the active account (not left as w).
+    assert_eq!(kc["test-user"].as_str().unwrap(), active_z);
+}
+
+/// Write an executable `claude` shim that simulates Claude Code refreshing the canonical
+/// credential by rewriting `from`→`to` in the keychain fixture file, and return a `PATH`
+/// value that resolves `claude` to it (keeping `/usr/bin:/bin` for `sed`).
+fn claude_shim_rotating(dir: &TempDir, from: &str, to: &str) -> std::ffi::OsString {
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let shim = bin_dir.join("claude");
+    std::fs::write(
+        &shim,
+        format!("#!/bin/sh\nsed -i '' 's/{from}/{to}/g' \"$CS_TEST_KEYCHAIN_FIXTURE\"\nexit 0\n"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&shim, perms).unwrap();
+    }
+    let mut path = bin_dir.into_os_string();
+    path.push(":/usr/bin:/bin");
+    path
 }
 
 #[test]
@@ -707,6 +1047,47 @@ fn save_rejects_path_traversal_name() {
 
     phase_c_env(&claude_home, &cs_home, &fixture)
         .args(["save", "foo/bar"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid profile name"));
+}
+
+#[test]
+fn rm_rejects_path_traversal_name() {
+    // `cs rm ../../foo` must be refused before any filesystem touch — otherwise profile_dir
+    // resolves outside the profiles tree and remove_dir_all could delete an arbitrary dir.
+    let (dir, claude_home, cs_home) = isolated();
+    let blob = fake_oauth("primary@example.com", 3600);
+    let fixture = fixture_path(dir.path(), &[("test-user", &blob)]);
+
+    phase_c_env(&claude_home, &cs_home, &fixture)
+        .args(["rm", "../../foo"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid profile name"));
+}
+
+#[test]
+fn rename_rejects_path_traversal_from() {
+    let (dir, claude_home, cs_home) = isolated();
+    let blob = fake_oauth("primary@example.com", 3600);
+    let fixture = fixture_path(dir.path(), &[("test-user", &blob)]);
+
+    phase_c_env(&claude_home, &cs_home, &fixture)
+        .args(["rename", "../evil", "ok"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid profile name"));
+}
+
+#[test]
+fn master_rejects_path_traversal_name() {
+    let (dir, claude_home, cs_home) = isolated();
+    let blob = fake_oauth("primary@example.com", 3600);
+    let fixture = fixture_path(dir.path(), &[("test-user", &blob)]);
+
+    phase_c_env(&claude_home, &cs_home, &fixture)
+        .args(["master", ".."])
         .assert()
         .failure()
         .stderr(predicate::str::contains("invalid profile name"));
@@ -1145,6 +1526,55 @@ fn autoswitch_tick_swaps_when_active_capped() {
     let settings: serde_json::Value =
         serde_json::from_slice(&std::fs::read(cs_home.join("settings.json")).unwrap()).unwrap();
     assert!(settings["last_switch_unix"].is_number());
+}
+
+#[test]
+fn autoswitch_tick_skips_stale_candidate() {
+    // A 429-stale candidate must not be chosen as a switch target (symmetric to the active
+    // stale gate). Active `a` is capped and fresh; the only other profile `b` is served from
+    // rate-limited stale cache showing healthy — the tick must NOT switch to it.
+    let (dir, home, claude_home, cs_home) = auto_switch_setup();
+    let blob_a = fake_oauth("a@example.com", 3600);
+    let blob_b = fake_oauth("b@example.com", 3600);
+    let fixture = fixture_path(
+        dir.path(),
+        &[
+            ("test-user", &blob_a),
+            ("Claude Code-credentials-a", &blob_a),
+            ("Claude Code-credentials-b", &blob_b),
+        ],
+    );
+    let limits_dir = dir.path().join("limits");
+    write_fixture_limits(&limits_dir, "a", 100.0, 50.0); // active: capped, fresh
+
+    // `b` is rate-limited and only available from primed (stale) cache showing healthy.
+    let fail_dir = dir.path().join("fail");
+    std::fs::create_dir_all(&fail_dir).unwrap();
+    std::fs::write(fail_dir.join("b.txt"), b"rate_limited").unwrap();
+    let cache_dir = cs_home.join("cache").join("usage-limits");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(
+        cache_dir.join("b.json"),
+        br#"{ "fetched_at_unix": 1700000000,
+              "payload": { "five_hour": {"utilization": 20, "resets_at": null},
+                           "seven_day": {"utilization": 10, "resets_at": null},
+                           "seven_day_sonnet": null, "seven_day_opus": null } }"#,
+    )
+    .unwrap();
+
+    write_settings(&cs_home, true);
+    write_active(&cs_home, "a");
+
+    auto_switch_env(&home, &claude_home, &cs_home, &fixture)
+        .env("CS_TEST_LIMITS_FIXTURE", &limits_dir)
+        .env("CS_TEST_LIMITS_FAIL", &fail_dir)
+        .arg("__autoswitch-tick")
+        .assert()
+        .success();
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cs_home.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["active"], "a", "must not switch to a stale candidate");
 }
 
 #[test]

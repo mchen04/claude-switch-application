@@ -2,7 +2,7 @@ use crate::cli::{DoctorArgs, GlobalOpts};
 use crate::doctor;
 use crate::error::Result;
 use crate::keychain::Keychain;
-use crate::output::{emit_json, OutputOpts};
+use crate::output::{emit, OutputOpts};
 use crate::paths::Paths;
 
 pub fn run(
@@ -12,13 +12,5 @@ pub fn run(
     _args: &DoctorArgs,
 ) -> Result<()> {
     let report = doctor::run(paths, kc)?;
-    if global.json {
-        emit_json(&report)?;
-    } else {
-        let opts = OutputOpts {
-            json: false,
-        };
-        crate::output::emit(opts, &report)?;
-    }
-    Ok(())
+    emit(OutputOpts { json: global.json }, &report)
 }

@@ -5,7 +5,7 @@ use serde::Serialize;
 use crate::cli::{GlobalOpts, StatusArgs};
 use crate::error::{Error, Result};
 use crate::keychain::{self, Keychain};
-use crate::output::{emit, emit_json, OutputOpts};
+use crate::output::{emit, OutputOpts};
 use crate::paths::Paths;
 use crate::profile::{human_expiry, OauthCreds, ProfileSummary};
 use crate::state::State;
@@ -15,7 +15,7 @@ pub struct StatusReport {
     pub active: Option<ProfileSummary>,
     pub default: Option<String>,
     pub previous: Option<String>,
-    /// True when the requested profile is not the active one.
+    /// The profile the caller explicitly asked about, if any (None when defaulting to active).
     pub asked_about: Option<String>,
 }
 
@@ -25,13 +25,7 @@ pub fn run(paths: &Paths, kc: &dyn Keychain, global: &GlobalOpts, args: &StatusA
         kc,
         args.name.as_deref().or(global.profile.as_deref()),
     )?;
-    if global.json {
-        emit_json(&report)?;
-    } else {
-        let opts = OutputOpts { json: false };
-        emit(opts, &report)?;
-    }
-    Ok(())
+    emit(OutputOpts { json: global.json }, &report)
 }
 
 pub fn build(paths: &Paths, kc: &dyn Keychain, requested: Option<&str>) -> Result<StatusReport> {

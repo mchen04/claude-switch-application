@@ -10,6 +10,11 @@ pub fn run(paths: &Paths, kc: &dyn Keychain, _global: &GlobalOpts, args: &SaveAr
     let canonical = keychain::canonical_account();
     let target = keychain::profile_account(&args.name);
 
+    // Acquire the lock before the decisive reads so the blob we snapshot is the canonical
+    // credential as of the locked moment — not one a concurrent switch/rotation has already
+    // moved past (which would persist an already-rotated, soon-invalid token into the profile).
+    let _lock = CsLock::acquire(paths)?;
+
     let canonical_blob = kc.read(&canonical).map_err(|_| {
         Error::Other("no active Claude credential to save (run `claude /login` first)".into())
     })?;
@@ -19,7 +24,6 @@ pub fn run(paths: &Paths, kc: &dyn Keychain, _global: &GlobalOpts, args: &SaveAr
 
     let claude_settings = std::fs::read(paths.claude_settings()).ok();
 
-    let _lock = CsLock::acquire(paths)?;
     keychain::write_verified(kc, &target, &canonical_blob)?;
     if let Some(settings) = claude_settings.as_deref() {
         crate::jsonio::atomic_write_bytes(&paths.profile_claude_settings(&args.name), settings)?;

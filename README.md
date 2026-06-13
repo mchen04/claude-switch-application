@@ -162,6 +162,14 @@ Keychain entries:
   so two concurrent `cs` invocations can't clobber each other.
 - Every Keychain write is read back and verified byte-equal; on mismatch the
   switch rolls back to the previous credential.
+- **No surprise logouts.** Claude Code silently rotates the OAuth
+  access **and refresh** token in its live Keychain entry as it runs, and a
+  rotated refresh token invalidates its predecessor server-side. Before
+  overwriting that entry, `cs` copies the *current* credential back into the
+  profile you're leaving — so switching away and back never reinstalls a
+  dead refresh token. `cs refresh` updates the active profile's live
+  credential in place (it only stages non-active profiles), so a refresh can't
+  leave your running session on an invalid token.
 
 ## Development
 

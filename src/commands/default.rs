@@ -6,6 +6,7 @@ use crate::paths::Paths;
 use crate::state::State;
 
 pub fn set(paths: &Paths, kc: &dyn Keychain, _global: &GlobalOpts, args: &NameArg) -> Result<()> {
+    crate::paths::validate_profile_name(&args.name)?;
     let target = keychain::profile_account(&args.name);
     if kc.read(&target).is_err() {
         return Err(Error::ProfileNotFound(args.name.clone()));
