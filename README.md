@@ -20,7 +20,7 @@ already installed and logged in, and `~/.local/bin` (or your chosen
 `CS_INSTALL_DIR`) on your `PATH`.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mchen04/claude-swtich-application/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/mchen04/claude-switch/main/install.sh | sh
 cs setup            # install the shell wrapper into ~/.zshrc
 cs doctor           # verify install
 ```
@@ -32,8 +32,8 @@ to install elsewhere.
 ### From source
 
 ```bash
-git clone https://github.com/mchen04/claude-swtich-application
-cd claude-swtich-application
+git clone https://github.com/mchen04/claude-switch
+cd claude-switch
 cargo build --release
 cp target/release/cs ~/.local/bin/
 cs setup

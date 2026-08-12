@@ -6,7 +6,7 @@ rust-version = "1.78"
 authors = ["Michael Chen <michael@zergai.com>"]
 description = "Claude Code account switcher with master-profile sharing and per-profile usage dashboard"
 license = "MIT"
-repository = "https://github.com/mchen04/claude-swtich-application"
+repository = "https://github.com/mchen04/claude-switch"
 
 [[bin]]
 name = "cs"

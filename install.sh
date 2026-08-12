@@ -1,10 +1,10 @@
 #!/usr/bin/env sh
 # cs installer — downloads the latest macOS release and installs to ~/.local/bin.
-# Usage: curl -fsSL https://raw.githubusercontent.com/mchen04/claude-swtich-application/main/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/mchen04/claude-switch/main/install.sh | sh
 
 set -eu
 
-REPO="mchen04/claude-swtich-application"
+REPO="mchen04/claude-switch"
 BIN_DIR="${CS_INSTALL_DIR:-$HOME/.local/bin}"
 
 OS="$(uname -s)"
